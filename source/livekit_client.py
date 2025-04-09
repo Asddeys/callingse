@@ -1,23 +1,29 @@
 """
-LiveKit Client Module
+LiveKit Client Module - Production Optimized
 
 Provides functions for interacting with LiveKit services for audio
 processing, including room management, voice pipeline setup,
 Deepgram integration for STT, Cartesia for TTS, and Silero VAD for
 silence detection with noise suppression.
 
-This version includes enhanced support for E.164 phone number format and
-updated API endpoints for LiveKit's latest features.
+Optimized for production with:
+- Connection pooling
+- Token caching
+- Retry logic
+- Circuit breaker pattern
+- Enhanced logging
 """
 
 import os
 import json
 import time
-import requests
 import logging
 import jwt
 from datetime import datetime, timedelta
 import uuid
+import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 # Configure logging
 logger = logging.getLogger()
@@ -36,12 +42,36 @@ DEEPGRAM_API_KEY = os.environ.get('DEEPGRAM_API_KEY')
 CARTESIA_API_KEY = os.environ.get('CARTESIA_API_KEY')
 
 # Voice settings
-DEFAULT_VOICE = os.environ.get('DEFAULT_VOICE', 'alloy') # Using one of the newer voices
+DEFAULT_VOICE = os.environ.get('DEFAULT_VOICE', 'alloy')
 VOICE_LANGUAGE = os.environ.get('VOICE_LANGUAGE', 'en-US')
+
+# Setup connection pooling with retry logic
+session = requests.Session()
+retries = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[502, 503, 504, 429],
+    allowed_methods=["GET", "POST"]
+)
+session.mount('https://', HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=20))
+
+# Token cache
+_token_cache = {}
+
+# Circuit breaker state
+_circuit_state = {
+    'livekit_api': {
+        'status': 'CLOSED',  # CLOSED, OPEN, HALF-OPEN
+        'failures': 0,
+        'last_failure': 0,
+        'threshold': 5,
+        'timeout': 60  # seconds
+    }
+}
 
 def create_jwt_token(permissions=None):
     """
-    Create a JWT token for LiveKit API authentication with correct permissions
+    Create a JWT token for LiveKit API authentication with correct permissions and caching
     
     Args:
         permissions (dict): Permission claims to include in token
@@ -49,6 +79,15 @@ def create_jwt_token(permissions=None):
     Returns:
         str: JWT token
     """
+    cache_key = str(permissions)
+    
+    # Check if we have a valid cached token
+    if cache_key in _token_cache:
+        token_data = _token_cache[cache_key]
+        # Check if token is still valid (with 5 minute buffer)
+        if token_data['expiry'] > time.time() + 300:
+            return token_data['token']
+    
     api_key = LIVEKIT_API_KEY
     api_secret = LIVEKIT_API_SECRET
     
@@ -72,11 +111,12 @@ def create_jwt_token(permissions=None):
     
     # Create token payload
     now = int(time.time())
+    expiry = now + 3600  # 1 hour expiration
     payload = {
         "iss": api_key,
         "nbf": now,
-        "exp": now + 3600,  # 1 hour expiration
-        "sub": "server"  # Using 'server' as subject for API calls
+        "exp": expiry,
+        "sub": "server"
     }
     
     # Add permissions to payload
@@ -86,91 +126,168 @@ def create_jwt_token(permissions=None):
     # Create and sign token
     token = jwt.encode(payload, api_secret, algorithm='HS256')
     if isinstance(token, bytes):
-        return token.decode('utf-8')
+        token = token.decode('utf-8')
+    
+    # Cache the token
+    _token_cache[cache_key] = {
+        'token': token,
+        'expiry': expiry
+    }
+    
     return token
 
-def make_api_request(endpoint, payload=None, method="POST"):
+def get_permissions_for_endpoint(endpoint):
     """
-    Make a request to the LiveKit API
+    Get appropriate permissions for a specific API endpoint
+    
+    Args:
+        endpoint (str): API endpoint
+        
+    Returns:
+        dict: Permissions for token
+    """
+    if "rooms" in endpoint and "add_sip" in endpoint:
+        return {
+            "video": {"roomAdmin": True},
+            "sip": {"create": True, "list": True, "admin": True}
+        }
+    elif "rooms" in endpoint:
+        return {"video": {"roomCreate": True, "roomList": True, "roomAdmin": True}}
+    elif "sip" in endpoint:
+        return {"sip": {"create": True, "list": True, "admin": True}}
+    else:
+        # Default permissions for other endpoints
+        return {
+            "video": {"roomCreate": True, "roomList": True, "roomAdmin": True},
+            "sip": {"create": True, "list": True, "admin": True}
+        }
+
+def parse_response(response):
+    """
+    Parse API response handling empty or non-JSON responses
+    
+    Args:
+        response (Response): Requests response object
+        
+    Returns:
+        dict: Parsed response
+    """
+    # Handle empty responses
+    if not response.text or response.text.strip() == "":
+        return {"status": "success"}
+    
+    # Try to parse as JSON
+    try:
+        return response.json()
+    except:
+        # Return text if not JSON
+        return {"status": "success", "text": response.text}
+
+def make_api_request(endpoint, payload=None, method="POST", operation_name="api_request"):
+    """
+    Make a request to the LiveKit API with circuit breaker pattern
     
     Args:
         endpoint (str): API endpoint
         payload (dict): Request payload
         method (str): HTTP method (GET, POST, etc.)
+        operation_name (str): Name of operation for logging
         
     Returns:
         dict: API response
     """
-    api_url = LIVEKIT_API_URL
+    circuit = _circuit_state['livekit_api']
+    call_id = payload.get('room_name', payload.get('name', 'unknown'))
     
-    # Determine token permissions based on endpoint
-    permissions = None
-    if "rooms" in endpoint and "add_sip" in endpoint:
-        permissions = {
-            "video": {"roomAdmin": True},
-            "sip": {"create": True, "list": True, "admin": True}
-        }
-    elif "rooms" in endpoint:
-        permissions = {"video": {"roomCreate": True, "roomList": True, "roomAdmin": True}}
-    elif "sip" in endpoint:
-        permissions = {"sip": {"create": True, "list": True, "admin": True}}
-    else:
-        # Default permissions for other endpoints
-        permissions = {
-            "video": {"roomCreate": True, "roomList": True, "roomAdmin": True},
-            "sip": {"create": True, "list": True, "admin": True}
+    # Check if circuit is OPEN
+    if circuit['status'] == 'OPEN':
+        # Check if timeout has expired
+        if time.time() - circuit['last_failure'] > circuit['timeout']:
+            # Move to HALF-OPEN
+            circuit['status'] = 'HALF-OPEN'
+            logger.info(f"[{call_id}] LiveKit API circuit breaker moved to HALF-OPEN state")
+        else:
+            # Circuit is OPEN and timeout hasn't expired
+            logger.warning(f"[{call_id}] LiveKit API circuit is OPEN. Request to {endpoint} rejected")
+            return {"status": "error", "error": "Service temporarily unavailable", "circuit": "OPEN"}
+    
+    try:
+        # Generate token with appropriate permissions
+        token = create_jwt_token(get_permissions_for_endpoint(endpoint))
+        
+        # Ensure endpoint starts with /
+        if not endpoint.startswith('/'):
+            endpoint = f"/{endpoint}"
+        
+        # Build full URL
+        url = f"{LIVEKIT_API_URL}{endpoint}"
+        
+        # Set headers
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
         }
         
-    # Create token with appropriate permissions
-    token = create_jwt_token(permissions)
-    
-    # Ensure endpoint starts with /
-    if not endpoint.startswith('/'):
-        endpoint = f"/{endpoint}"
-    
-    # Build full URL
-    url = f"{api_url}{endpoint}"
-    
-    # Set headers
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    
-    # Make request
-    try:
+        # Make request with connection pooling
+        start_time = time.time()
+        
+        logger.info(f"[{call_id}] Making {method} request to {endpoint}")
+        
         if method.upper() == "GET":
-            response = requests.get(url, headers=headers)
+            response = session.get(url, headers=headers, timeout=10)
         else:  # POST or other methods
-            response = requests.post(url, headers=headers, json=payload)
+            response = session.post(url, headers=headers, json=payload, timeout=10)
+        
+        # Log performance metrics
+        duration_ms = (time.time() - start_time) * 1000
+        logger.info(f"[{call_id}] {operation_name} completed in {duration_ms:.2f}ms with status {response.status_code}")
         
         # Check response
         if response.status_code in [200, 201]:
-            # Some LiveKit endpoints return empty responses for success
-            if not response.text or response.text.strip() == "":
-                return {"status": "success"}
+            # If successful and circuit was HALF-OPEN, close it
+            if circuit['status'] == 'HALF-OPEN':
+                circuit['status'] = 'CLOSED'
+                circuit['failures'] = 0
+                logger.info(f"[{call_id}] LiveKit API circuit breaker moved to CLOSED state")
             
-            # Try to parse as JSON
-            try:
-                return response.json()
-            except:
-                # Return text if not JSON
-                return {"status": "success", "text": response.text}
+            # Return success
+            result = parse_response(response)
+            return result
         else:
             # Handle error
             error_msg = f"API request failed: {response.status_code} - {response.text}"
-            logger.error(error_msg)
-            return {"status": "error", "error": error_msg}
+            logger.error(f"[{call_id}] {error_msg}")
+            
+            # Record failure for circuit breaker
+            circuit['failures'] += 1
+            circuit['last_failure'] = time.time()
+            
+            # Check if we've reached failure threshold
+            if circuit['failures'] >= circuit['threshold'] and circuit['status'] != 'OPEN':
+                circuit['status'] = 'OPEN'
+                logger.warning(f"[{call_id}] LiveKit API circuit breaker moved to OPEN state after {circuit['failures']} failures")
+            
+            return {"status": "error", "error": error_msg, "code": response.status_code}
     except Exception as e:
-        logger.error(f"Exception in API request: {str(e)}")
+        logger.error(f"[{call_id}] Exception in {operation_name}: {str(e)}")
+        
+        # Record failure for circuit breaker
+        circuit['failures'] += 1
+        circuit['last_failure'] = time.time()
+        
+        # Check if we've reached failure threshold
+        if circuit['failures'] >= circuit['threshold'] and circuit['status'] != 'OPEN':
+            circuit['status'] = 'OPEN'
+            logger.warning(f"[{call_id}] LiveKit API circuit breaker moved to OPEN state after {circuit['failures']} failures")
+        
         return {"status": "error", "error": str(e)}
 
 def create_room(room_name):
     """
-    Create a LiveKit room with updated API
+    Create a LiveKit room with updated API compatible with your dispatch rule
     
     Args:
-        room_name (str): Name of the room to create
+        room_name (str): Name of the room to create, should use call- prefix
         
     Returns:
         dict: Room creation response
@@ -178,23 +295,30 @@ def create_room(room_name):
     # API endpoint for room creation (using TWIRP)
     endpoint = "/twirp/livekit.RoomService/CreateRoom"
     
-    # Prepare payload
+    # Ensure room name follows your dispatch rule format
+    if not room_name.startswith('call-'):
+        logger.warning(f"Room name {room_name} doesn't start with 'call-' prefix required by dispatch rule")
+    
+    # Prepare payload with parameters matching your LiveKit dispatch rule requirements
     payload = {
         "name": room_name,
         "emptyTimeout": 300,  # 5 minutes timeout for empty rooms
         "maxParticipants": 10,
-        "metadata": json.dumps({"audio_only": True})
+        "metadata": json.dumps({
+            "audio_only": True,
+            "agent_metadata": "job dispatch metadata"  # Matching your dispatch rule roomConfig
+        })
     }
     
     # Make API request
-    response = make_api_request(endpoint, payload)
+    response = make_api_request(endpoint, payload, operation_name="create_room")
     
     logger.info(f"Created LiveKit room: {room_name}")
     return response
 
 def get_room(room_name):
     """
-    Get information about a LiveKit room
+    Get information about a LiveKit room with idempotency support
     
     Args:
         room_name (str): Name of the room
@@ -211,9 +335,7 @@ def get_room(room_name):
     }
     
     # Make API request
-    response = make_api_request(endpoint, payload)
-    
-    return response
+    return make_api_request(endpoint, payload, operation_name="get_room")
 
 def close_room(room_name):
     """
@@ -234,7 +356,7 @@ def close_room(room_name):
     }
     
     # Make API request
-    response = make_api_request(endpoint, payload)
+    response = make_api_request(endpoint, payload, operation_name="close_room")
     
     logger.info(f"Closed LiveKit room: {room_name}")
     return response
@@ -293,7 +415,7 @@ def setup_voice_pipeline(room_name, call_id=None):
     }
     
     # Make API request
-    response = make_api_request(endpoint, payload)
+    response = make_api_request(endpoint, payload, operation_name="setup_voice_pipeline")
     
     # Configure additional voice services (TTS and recording) if needed
     # This maintains backward compatibility with older code while using new API structure
@@ -313,7 +435,7 @@ def setup_voice_pipeline(room_name, call_id=None):
 
 def speak_text(room_name, text):
     """
-    Speak text using TTS via LiveKit
+    Speak text using TTS via LiveKit with error handling
     
     Args:
         room_name (str): Name of the room
@@ -332,7 +454,7 @@ def speak_text(room_name, text):
     }
     
     # Make API request
-    response = make_api_request(endpoint, payload)
+    response = make_api_request(endpoint, payload, operation_name="speak_text")
     
     logger.info(f"Speaking text in room: {room_name}")
     return response
@@ -349,43 +471,53 @@ def add_sip_participant(room_name, sip_uri):
     Returns:
         dict: Participant addition response
     """
-    # API endpoint for adding SIP participant
-    endpoint = f"/v1/rooms/{room_name}/participants/add_sip"
+    # Deprecated - use add_sip_participant_to_trunk instead
+    logger.warning(f"add_sip_participant is deprecated, use add_sip_participant_to_trunk with trunk_id instead")
+    return add_sip_participant_to_trunk(room_name, sip_uri)
+
+def add_sip_participant_to_trunk(room_name, sip_uri, trunk_id="ST_AVaQRtrTSDtj"):
+    """
+    Add a SIP participant to a LiveKit room through a specific trunk
     
-    # Determine identity based on SIP URI
+    Args:
+        room_name (str): Name of the room
+        sip_uri (str): SIP URI to add
+        trunk_id (str): LiveKit trunk ID to use (defaults to your Vici Trunk)
+        
+    Returns:
+        dict: Participant addition response
+    """
+    # API endpoint for adding SIP participant via trunk
+    endpoint = "/twirp/livekit.RoomService/CreateSIPParticipant"
+    
+    # Extract the user part of the SIP URI for identity
     identity = "customer"
-    
-    # Extract the user part of the SIP URI
     if '@' in sip_uri:
         user_part = sip_uri.split('@')[0]
         if user_part.startswith('sip:'):
             user_part = user_part[4:]  # Remove 'sip:' prefix if present
             
         if user_part.startswith('+'):
-            # If it's an E.164 number, use it as the identity
             identity = user_part
         elif user_part.startswith('call_'):
-            # If it's a call_id, use it as the identity
             identity = user_part
     
     # Make sure sip_uri has sip: prefix
     if not sip_uri.startswith('sip:'):
         sip_uri = f"sip:{sip_uri}"
     
-    # Prepare payload
+    # Prepare payload using your trunk ID
     payload = {
-        "address": sip_uri,
-        "identity": identity,
-        "client_metadata": json.dumps({
-            "type": "customer",
-            "auto_subscribe": True
-        })
+        "room_name": room_name,
+        "trunk_id": trunk_id,  # Your specific trunk ID
+        "participant_identity": identity,
+        "participant_name": f"Customer-{identity}"
     }
     
     # Make API request
-    response = make_api_request(endpoint, payload)
+    response = make_api_request(endpoint, payload, operation_name="add_sip_participant_to_trunk")
     
-    logger.info(f"Added SIP participant {sip_uri} to room: {room_name}")
+    logger.info(f"Added SIP participant via trunk {trunk_id} to room: {room_name}")
     return response
 
 def create_e164_dispatch_rule():
@@ -407,14 +539,14 @@ def create_e164_dispatch_rule():
         "pattern": "^(\\+[0-9]+)@.*$",
         "priority": 200,
         "roomNameRegex": {
-            "roomNameRegex": "$1",
+            "roomNameRegex": "call-$1",  # Use call- prefix to match your dispatch rule
             "createIfNotExists": True
         },
         "webhook_url": f"{api_gateway_url}/v1/inbound_sip"
     }
     
     # Make API request
-    response = make_api_request(endpoint, payload)
+    response = make_api_request(endpoint, payload, operation_name="create_dispatch_rule")
     
     logger.info(f"Created E.164 SIP dispatch rule")
     return response
@@ -438,14 +570,14 @@ def create_call_prefix_dispatch_rule():
         "pattern": "^(call_[a-z0-9]+)@.*$",
         "priority": 100,
         "roomNameRegex": {
-            "roomNameRegex": "$1",
+            "roomNameRegex": "call-$1",  # Use call- prefix to match your dispatch rule
             "createIfNotExists": True
         },
         "webhook_url": f"{api_gateway_url}/v1/inbound_sip"
     }
     
     # Make API request
-    response = make_api_request(endpoint, payload)
+    response = make_api_request(endpoint, payload, operation_name="create_dispatch_rule")
     
     logger.info(f"Created call prefix SIP dispatch rule")
     return response
@@ -461,7 +593,7 @@ def get_sip_dispatch_rules():
     endpoint = "/v1/sip/dispatch/rules/list"
     
     # Make API request
-    response = make_api_request(endpoint, {}, "GET")
+    response = make_api_request(endpoint, {}, "GET", operation_name="get_dispatch_rules")
     
     return response
 
@@ -514,7 +646,7 @@ def get_call_status(call_id, room_name=None):
     """
     # Use call_id as room_name if not provided
     if room_name is None:
-        room_name = call_id
+        room_name = f"call-{call_id}"  # Use call- prefix to match your dispatch rule
         
     # Get room status using updated TWIRP API
     endpoint = "/twirp/livekit.RoomService/GetRoom"
@@ -525,7 +657,7 @@ def get_call_status(call_id, room_name=None):
     }
     
     # Make API request
-    response = make_api_request(endpoint, payload)
+    response = make_api_request(endpoint, payload, operation_name="get_call_status")
     
     return response
 
@@ -548,3 +680,35 @@ def get_sip_uri(call_id):
             
     # Otherwise format as SIP URI
     return f"sip:{call_id}@{LIVEKIT_SIP_DOMAIN}"
+
+def extract_phone_number_from_uri(sip_uri):
+    """
+    Extract a phone number from a SIP URI if present
+    
+    Args:
+        sip_uri (str): SIP URI
+        
+    Returns:
+        str: Phone number in E.164 format if found, else None
+    """
+    import re
+    
+    if not sip_uri:
+        return None
+        
+    # Look for E.164 format in the SIP URI
+    e164_match = re.search(r'(\+[0-9]+)@', sip_uri)
+    if e164_match:
+        return e164_match.group(1)
+        
+    # Look for numeric sequence that could be a phone number
+    digit_match = re.search(r'([0-9]{10,15})@', sip_uri)
+    if digit_match:
+        digits = digit_match.group(1)
+        # Format as E.164
+        if len(digits) == 10:  # US number without country code
+            return f"+1{digits}"
+        elif len(digits) > 10:
+            return f"+{digits}"
+    
+    return None
